@@ -65,7 +65,7 @@ def convert_hf_checkpoint(
 
     merged_result = {}
     for file in sorted(bin_files):
-        state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
+        state_dict = torch.load(str(file), map_location="cpu", weights_only=False)
         merged_result.update(state_dict)
     final_result = {}
     for key, value in merged_result.items():
@@ -92,8 +92,9 @@ def convert_hf_checkpoint(
             del final_result[key]
             del final_result[key.replace("wq", "wk")]
             del final_result[key.replace("wq", "wv")]
-    print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
-    torch.save(final_result, checkpoint_dir / "model.pth")
+    output_dir = Path('/home/wangruonan/yina/yina/gpt-fast/scripts/checkpoints/meta-llama/llama2-13b-chat')
+    print(f"Saving checkpoint to {output_dir / 'model.pth'}")
+    torch.save(final_result, output_dir / "model.pth")
 
 if __name__ == '__main__':
     import argparse

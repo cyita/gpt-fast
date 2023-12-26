@@ -59,7 +59,7 @@ transformer_configs = {
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.float16):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
@@ -90,8 +90,9 @@ class Transformer(nn.Module):
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
+        self.device = torch.device('cpu')
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, dtype):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -99,7 +100,7 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype=dtype)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
