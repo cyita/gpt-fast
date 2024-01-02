@@ -30,7 +30,7 @@ from sentencepiece import SentencePieceProcessor
 from model import Transformer
 from tp import maybe_init_dist
 
-from transformers import LlamaTokenizer, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+from transformers import LlamaTokenizer, GenerationConfig, LogitsProcessorList, StoppingCriteriaList, top_k_top_p_filtering
 import warnings
 import logging
 import inspect
@@ -52,10 +52,34 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
 
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[0, -1], temperature, top_k)
-    idx_next = multinomial_sample_one_no_sync(probs)
-    return idx_next, probs
+# def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+#     probs = logits_to_probs(logits[0, -1], temperature, top_k)
+#     idx_next = multinomial_sample_one_no_sync(probs)
+#     return idx_next, probs
+
+def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=50, top_p: float=0.7, temperature: float=0.7):
+
+    if return_probs:
+
+        all_probs = logits.softmax(-1)
+        if do_sample and top_k != 1 and top_p != 0.0 and temperature != 0.0:
+            _logits = top_k_top_p_filtering(logits.view(-1, logits.size(-1)) / temperature, top_k=top_k, top_p=top_p)
+            output_ids = torch.multinomial(_logits.softmax(-1), num_samples=1).view(logits.shape[:-1])
+            probs = torch.gather(all_probs, -1, output_ids.unsqueeze(-1)).squeeze(-1)
+        else:
+            probs, output_ids = torch.max(all_probs, dim=-1)
+            
+        return output_ids, probs
+
+    else:
+
+        if do_sample and top_k != 1 and top_p != 0.0 and temperature != 0.0:
+            _logits = top_k_top_p_filtering(logits.view(-1, logits.size(-1)) / temperature, top_k=top_k, top_p=top_p)
+            output_ids = torch.multinomial(_logits.softmax(-1), num_samples=1).view(logits.shape[:-1])
+        else:
+            output_ids = torch.argmax(logits, dim=-1)
+            
+        return output_ids
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
@@ -307,13 +331,15 @@ def generate(
         output_attentions = (model.generation_config.output_attentions)
         output_hidden_states = (model.generation_config.output_hidden_states)
         while n < generation_config.max_length:
-            
+            past_key_values = None
 
             # Step 1: auto-regressive decode K tokens from draft model and get final p
-            draft_input_ids = copy.deepcopy(input_ids)
+            draft_input_ids = input_ids.clone()
+            draft_model_kwargs = copy.deepcopy(model_kwargs)
+            draft_tokens, draft_probs = [], []
             for _ in range(speculate_k):
                 # prepare model inputs
-                model_inputs = draft_model.prepare_inputs_for_generation(draft_input_ids, **model_kwargs)
+                model_inputs = draft_model.prepare_inputs_for_generation(draft_input_ids, **draft_model_kwargs)
                 outputs = draft_model(
                     **model_inputs,
                     return_dict=True,
@@ -330,8 +356,63 @@ def generate(
                 probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-
                 draft_input_ids = torch.cat([draft_input_ids, next_tokens[:, None]], dim=-1)
+
+                draft_tokens.append(next_tokens.clone())
+                draft_probs.append(probs.clone())
+
+                draft_model_kwargs = draft_model._update_model_kwargs_for_generation(
+                    outputs, draft_model_kwargs, is_encoder_decoder=draft_model.config.is_encoder_decoder
+                )
+            
+            draft_tokens_cpu = torch.cat(draft_tokens)
+            draft_probs_cpu = torch.stack(draft_probs)
+            draft_probs_cpu = draft_probs_cpu.squeeze()
+
+            # inference on target model using draft tokens
+            draft_model_kwargs["past_key_values"] = past_key_values
+            model_inputs = model.prepare_inputs_for_generation(draft_input_ids, **draft_model_kwargs)
+            outputs = model(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            next_token_logits = outputs.logits[:, -speculate_k:, :]
+                
+            # pre-process distribution
+            next_token_scores = logits_processor(draft_input_ids, next_token_logits)
+            next_token_scores = logits_warper(draft_input_ids, next_token_scores)
+            target_probs_cpu = torch.nn.functional.softmax(next_token_scores, dim=-1).squeeze()
+
+            # q: target prob, p: draft prob
+            # q >= p: always accept draft token
+            # q < p: q/p prob to accept draft token
+            p = draft_probs_cpu[torch.arange(0, speculate_k, device='cpu'), draft_tokens_cpu]
+            q = target_probs_cpu[torch.arange(0, speculate_k, device='cpu'), draft_tokens_cpu]
+            accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
+            rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
+
+            if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
+                accept_length = speculate_k + 1
+                last_token = multinomial_sample_one_no_sync(target_probs[-1])
+                # fill last token into draft model
+                model_forward(
+                    draft_model,
+                    draft_tokens[-1].view(1, -1),
+                    orig_input_pos + speculate_k,
+                )
+                return torch.cat([draft_tokens, last_token])
+            else:
+                accept_length = rejected_locations[0].item()
+                p = draft_probs[accept_length]
+                q = target_probs[accept_length]
+                new = q - p
+                new = torch.where(new > 0, new, 0.0)
+                new = new / new.sum()
+                next_token = multinomial_sample_one_no_sync(new)
+                return torch.cat([draft_tokens[:accept_length], next_token])
+
 
 
         # device, dtype = prompt.device, prompt.dtype
