@@ -289,7 +289,7 @@ def generate(
                 "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
             )
         generation_config.max_length = generation_config.max_new_tokens + input_ids_length
-    generation_config.max_length = generation_config.max_length + speculate_k + 1 if is_speculative else generation_config.max_length
+    # generation_config.max_length = generation_config.max_length + speculate_k + 1 if is_speculative else generation_config.max_length
     model._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
     # Here we use sample generation mode
@@ -329,8 +329,6 @@ def generate(
     if is_speculative:
         n = input_ids_length
         past_key_values = None
-        output_attentions = (model.generation_config.output_attentions)
-        output_hidden_states = (model.generation_config.output_hidden_states)
         generate_ids = torch.empty([input_ids.size(0), generation_config.max_length], dtype=torch.long, device=model.device)
         draft_generate_ids = torch.empty([input_ids.size(0), speculate_k + 1], dtype=torch.long, device=model.device)
         # Prefill with main model
@@ -342,13 +340,14 @@ def generate(
         output_ids = sample(next_token_logits, do_sample=True, top_k=generation_config.top_k,
                             top_p=generation_config.top_p, temperature=generation_config.temperature)
         generate_ids[:, 0] = output_ids
-        current_input_ids = output_ids
+        current_input_ids = output_ids.unsqueeze(0)
         past_key_values = outputs['past_key_values']
         n += 1
+        input_ids = torch.cat([input_ids, current_input_ids], dim=-1)
 
         while n < generation_config.max_length:
             # Step 1: auto-regressive decode K tokens from draft model and get final p
-            draft_current_input_ids = current_input_ids.unsqueeze(0)
+            draft_current_input_ids = current_input_ids
             draft_past_key_values = past_key_values
             draft_generate_ids[:, 0] = current_input_ids
             draft_prob_list = []
@@ -386,6 +385,9 @@ def generate(
                                 top_p=generation_config.top_p, temperature=generation_config.temperature)
             past_key_values = output['past_key_values']
 
+            max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0).sum(-1).item() + 1
+            max_of_max_matched = logits.size(-2)
+
             draft_tokens_cpu = drafted_input_ids[:, 1:].squeeze()
             draft_probs_cpu = torch.stack(draft_prob_list).squeeze()
 
@@ -399,23 +401,35 @@ def generate(
 
             if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
                 accept_length = speculate_k + 1
-                last_token = multinomial_sample_one_no_sync(target_probs[-1])
-                # fill last token into draft model
-                model_forward(
-                    draft_model,
-                    draft_tokens[-1].view(1, -1),
-                    orig_input_pos + speculate_k,
-                )
-                return torch.cat([draft_tokens, last_token])
+                last_token = multinomial_sample_one_no_sync(target_probs_cpu[-1])
+                # # fill last token into draft model
+                # model_forward(
+                #     draft_model,
+                #     draft_tokens[-1].view(1, -1),
+                #     orig_input_pos + speculate_k,
+                # )
+                next_tokens = torch.cat([draft_tokens_cpu, last_token])
             else:
                 accept_length = rejected_locations[0].item()
-                p = draft_probs[accept_length]
-                q = target_probs[accept_length]
+                p = draft_probs_cpu[accept_length]
+                q = target_probs_cpu[accept_length]
                 new = q - p
                 new = torch.where(new > 0, new, 0.0)
                 new = new / new.sum()
                 next_token = multinomial_sample_one_no_sync(new)
-                return torch.cat([draft_tokens[:accept_length], next_token])
+                next_tokens = torch.cat([draft_tokens_cpu[:accept_length], next_token])
+                # Reset past_key_values
+                past_key_values = [
+                    (k[:, :, :-(max_of_max_matched - accept_length - 1)], v[:, :, :-(max_of_max_matched - accept_length - 1)]) for k, v in past_key_values
+                ]
+                past_key_values
+
+            accept_counts[len(next_tokens) - 1] += 1
+            num_added = min(generation_config.max_length - n - 1, len(next_tokens))
+            n += num_added
+            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(0)], dim=-1)
+            current_input_ids = input_ids[:, -1:]
+
 
 
 
