@@ -328,62 +328,66 @@ def generate(
     # 13. run sample
     if is_speculative:
         n = input_ids_length
+        past_key_values = None
         output_attentions = (model.generation_config.output_attentions)
         output_hidden_states = (model.generation_config.output_hidden_states)
+        generate_ids = torch.empty([input_ids.size(0), generation_config.max_length], dtype=torch.long, device=model.device)
+        draft_generate_ids = torch.empty([input_ids.size(0), speculate_k + 1], dtype=torch.long, device=model.device)
+        # Prefill with main model
+        outputs = model(input_ids=input_ids,
+                       past_key_values=past_key_values,
+                       return_dict=True,
+                       use_cache=True)
+        next_token_logits = outputs.logits[:, -1, :]
+        output_ids = sample(next_token_logits, do_sample=True, top_k=generation_config.top_k,
+                            top_p=generation_config.top_p, temperature=generation_config.temperature)
+        generate_ids[:, 0] = output_ids
+        current_input_ids = output_ids
+        past_key_values = outputs['past_key_values']
+        n += 1
+
         while n < generation_config.max_length:
-            past_key_values = None
-
             # Step 1: auto-regressive decode K tokens from draft model and get final p
-            draft_input_ids = input_ids.clone()
-            draft_model_kwargs = copy.deepcopy(model_kwargs)
-            draft_tokens, draft_probs = [], []
-            for _ in range(speculate_k):
-                # prepare model inputs
-                model_inputs = draft_model.prepare_inputs_for_generation(draft_input_ids, **draft_model_kwargs)
-                outputs = draft_model(
-                    **model_inputs,
+            draft_current_input_ids = current_input_ids.unsqueeze(0)
+            draft_past_key_values = past_key_values
+            draft_generate_ids[:, 0] = current_input_ids
+            draft_prob_list = []
+            for step_draft in range(speculate_k):
+                draft_output = draft_model(
+                    input_ids=draft_current_input_ids,
+                    past_key_values=draft_past_key_values,
                     return_dict=True,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
+                    use_cache=True,
                 )
-                next_token_logits = outputs.logits[:, -1, :]
-                
-                # pre-process distribution
-                next_token_scores = logits_processor(draft_input_ids, next_token_logits)
-                next_token_scores = logits_warper(draft_input_ids, next_token_scores)
+                draft_probs = draft_output['logits'].softmax(-1)
+                draft_prob_list.append(draft_probs)
+                draft_output_ids, draft_output_probs = sample(draft_output['logits'],
+                                                              return_probs=True, do_sample=True,
+                                                              top_k=generation_config.top_k,
+                                                              top_p=generation_config.top_p,
+                                                              temperature=generation_config.temperature)
+                draft_generate_ids[:, step_draft + 1] = draft_output_ids
+                draft_current_input_ids = draft_output_ids
+                draft_past_key_values = draft_output['past_key_values']
 
-                # sample
-                probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
-                draft_input_ids = torch.cat([draft_input_ids, next_tokens[:, None]], dim=-1)
-
-                draft_tokens.append(next_tokens.clone())
-                draft_probs.append(probs.clone())
-
-                draft_model_kwargs = draft_model._update_model_kwargs_for_generation(
-                    outputs, draft_model_kwargs, is_encoder_decoder=draft_model.config.is_encoder_decoder
-                )
+                if draft_output_probs.item() < 0.1 or n + step_draft + 2 >= generation_config.max_new_tokens + input_ids_length:
+                    break
+        
+            drafted_n_tokens = step_draft + 1
+            drafted_input_ids = draft_generate_ids[:, : drafted_n_tokens + 1] # raft input + raft completion
             
-            draft_tokens_cpu = torch.cat(draft_tokens)
-            draft_probs_cpu = torch.stack(draft_probs)
-            draft_probs_cpu = draft_probs_cpu.squeeze()
+            output = model(input_ids=drafted_input_ids,
+                           past_key_values=past_key_values,
+                           return_dict=True,
+                           use_cache=True)
+            logits = output['logits']
+            target_probs_cpu = logits.softmax(-1).squeeze()
+            output_ids = sample(logits, do_sample=True, top_k=generation_config.top_k,
+                                top_p=generation_config.top_p, temperature=generation_config.temperature)
+            past_key_values = output['past_key_values']
 
-            # inference on target model using draft tokens
-            draft_model_kwargs["past_key_values"] = past_key_values
-            model_inputs = model.prepare_inputs_for_generation(draft_input_ids, **draft_model_kwargs)
-            outputs = model(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-            next_token_logits = outputs.logits[:, -speculate_k:, :]
-                
-            # pre-process distribution
-            next_token_scores = logits_processor(draft_input_ids, next_token_logits)
-            next_token_scores = logits_warper(draft_input_ids, next_token_scores)
-            target_probs_cpu = torch.nn.functional.softmax(next_token_scores, dim=-1).squeeze()
+            draft_tokens_cpu = drafted_input_ids[:, 1:].squeeze()
+            draft_probs_cpu = torch.stack(draft_prob_list).squeeze()
 
             # q: target prob, p: draft prob
             # q >= p: always accept draft token
