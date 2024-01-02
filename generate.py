@@ -6,6 +6,7 @@
 import itertools
 import sys
 import os
+import copy
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -29,6 +30,13 @@ from sentencepiece import SentencePieceProcessor
 from model import Transformer
 from tp import maybe_init_dist
 
+from transformers import LlamaTokenizer, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+import warnings
+import logging
+import inspect
+
+logger = logging.getLogger("bigdl.llm.speculative")
+
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -51,15 +59,15 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
-    logits = model(x, input_pos)
-    # logits = model(x).logits
+    # logits = model(x, input_pos)
+    logits = model(x).logits
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
-    logits = model(x, input_pos)
-    # logits = model(x).logits
+    # logits = model(x, input_pos)
+    logits = model(x).logits
     return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
@@ -77,7 +85,8 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
 
 
 def model_forward(model, x, input_pos):
-    return model(x, input_pos)
+    return model(x)
+    # return model(x, input_pos)
 
 def speculative_decode(
     model: Transformer,
@@ -135,12 +144,12 @@ def speculative_decode(
 @torch.no_grad()
 def generate(
     model: Transformer,
-    prompt: torch.Tensor,
-    max_new_tokens: int,
+    inputs: torch.Tensor,
     *,
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    generation_config: Optional[GenerationConfig] = None,
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -149,59 +158,240 @@ def generate(
     """
 
     is_speculative = draft_model is not None
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(0)
-    T_new = T + max_new_tokens
-    if interactive:
-        max_seq_length = 350
-    else:
-        max_seq_length = min(T_new, model.config.block_size)
-
-    device, dtype = prompt.device, prompt.dtype
-    max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
-    with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float16)
-        if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float32)
-
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
-    seq = empty
-    input_pos = torch.arange(0, T, device=device)
-
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
-
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
-    if is_speculative:
-        input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        while input_pos < T_new - 1:
-            cur_token = next_token.view(())
+    # priority: `generation_config` argument > `model.generation_config` (the default generation config)
+    if generation_config is None:
+        # legacy: users may modify the model configuration to control generation. To trigger this legacy behavior,
+        # two conditions must be met
+        # 1) the generation config must have been created from the model config (`_from_model_config` field);
+        # 2) the generation config must have seen no modification since its creation (the hash is the same).
+        if model.generation_config._from_model_config and model.generation_config._original_object_hash == hash(
+            model.generation_config
+        ):
+            new_generation_config = GenerationConfig.from_model_config(model.config)
+            if new_generation_config != model.generation_config:
+                warnings.warn(
+                    "You have modified the pretrained model configuration to control generation. This is a"
+                    " deprecated strategy to control generation and will be removed soon, in a future version."
+                    " Please use and modify the model generation configuration (see"
+                    " https://huggingface.co/docs/transformers/generation_strategies#default-text-generation-configuration )"
+                )
+                model.generation_config = new_generation_config
+        generation_config = model.generation_config
 
-            next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
-            )
+    generation_config = copy.deepcopy(generation_config)
+    model_kwargs = generation_config.update(**sampling_kwargs)  # All unused kwargs must be model kwargs
+    generation_config.validate()
+    model._validate_model_kwargs(model_kwargs.copy())
 
-            accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
-            for i in next_tokens[: num_added,]:
-                callback(i)
-            input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
+    if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+            if model_kwargs.get("attention_mask", None) is None:
+                logger.warning(
+                    "The attention mask and the pad token id were not set. As a consequence, you may observe "
+                    "unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
+                )
+            eos_token_id = generation_config.eos_token_id
+            if isinstance(eos_token_id, list):
+                eos_token_id = eos_token_id[0]
+            logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            generation_config.pad_token_id = eos_token_id
+
+    # 2. Set generation parameters if not already defined
+    logits_processor = LogitsProcessorList()
+    stopping_criteria = StoppingCriteriaList()
+
+    # 3. Define model inputs
+    # inputs_tensor has to be defined
+    # model_input_name is defined if model-specific keyword input is passed
+    # otherwise model_input_name is None
+    # all model-specific keyword inputs are removed from `model_kwargs`
+    inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
+            inputs, generation_config.bos_token_id, model_kwargs
+    )
+    batch_size = inputs_tensor.shape[0]
+
+    # 4. Define other model kwargs
+    model_kwargs["output_attentions"] = generation_config.output_attentions
+    model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
+    # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+    # generating the first new token or not, and we only want to use the embeddings for the first new token)
+    if not model.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+        model_kwargs["use_cache"] = True
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        model_kwargs["use_cache"] = generation_config.use_cache
+
+    accepts_attention_mask = "attention_mask" in set(inspect.signature(model.forward).parameters.keys())
+    requires_attention_mask = "encoder_outputs" not in model_kwargs
+
+    if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+        model_kwargs["attention_mask"] = model._prepare_attention_mask_for_generation(
+            inputs_tensor, generation_config.pad_token_id, generation_config.eos_token_id
+        )
+
+    # decoder-only models should use left-padding for generation
+    if not model.config.is_encoder_decoder:
+        # If `input_ids` was given, check if the last id in any sequence is `pad_token_id`
+        # Note: If using, `inputs_embeds` this check does not work, because we want to be more hands-off.
+        if (
+            generation_config.pad_token_id is not None
+            and len(inputs_tensor.shape) == 2
+            and torch.sum(inputs_tensor[:, -1] == generation_config.pad_token_id) > 0
+        ):
+            logger.warning(
+                "A decoder-only architecture is being used, but right-padding was detected! For correct "
+                "generation results, please set `padding_side='left'` when initializing the tokenizer."
+            )
+    else:
+        logger.error("encoder-decoder models are not supported now.")
+        raise TypeError("encoder-decoder models are not supported now.")
+
+    # yina: remove encoder_decoder part in the following code
+    # 5. Prepare `input_ids` which will be used for auto-regressive generation
+    input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+    
+    # if streamer is not None:
+    #     streamer.put(input_ids.cpu())
+
+    # 6. Prepare `max_length` depending on other stopping criteria.
+    input_ids_length = input_ids.shape[-1]
+    has_default_max_length = sampling_kwargs.get("max_length") is None and generation_config.max_length is not None
+    if generation_config.max_new_tokens is not None:
+        if not has_default_max_length and generation_config.max_length is not None:
+            logger.warning(
+                f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
+                f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
+                "Please refer to the documentation for more information. "
+                "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
+            )
+        generation_config.max_length = generation_config.max_new_tokens + input_ids_length
+    generation_config.max_length = generation_config.max_length + speculate_k + 1 if is_speculative else generation_config.max_length
+    model._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+    # Here we use sample generation mode
+    # 8. prepare distribution pre_processing samplers
+    logits_processor = model._get_logits_processor(
+        generation_config=generation_config,
+            input_ids_seq_length=input_ids_length,
+            encoder_input_ids=inputs_tensor,
+            prefix_allowed_tokens_fn=None,
+            logits_processor=logits_processor,
+            model_kwargs=model_kwargs,
+            negative_prompt_ids=None,
+            negative_prompt_attention_mask=None,
+    )
+
+    # 9. prepare stopping criteria
+    stopping_criteria = model._get_stopping_criteria(
+        generation_config=generation_config, stopping_criteria=stopping_criteria
+    )
+
+    # 11. prepare logits warper
+    logits_warper = model._get_logits_warper(generation_config)
+
+    # 12. expand input_ids with `num_return_sequences` additional sequences per batch
+    input_ids, model_kwargs = model._expand_inputs_for_generation(
+        input_ids=input_ids,
+        expand_size=generation_config.num_return_sequences,
+        is_encoder_decoder=model.config.is_encoder_decoder,
+        **model_kwargs,
+    )
 
     generate_stats = {
         'accept_counts': accept_counts
     }
-    return seq, generate_stats
+
+    # 13. run sample
+    if is_speculative:
+        n = input_ids_length
+        output_attentions = (model.generation_config.output_attentions)
+        output_hidden_states = (model.generation_config.output_hidden_states)
+        while n < generation_config.max_length:
+            
+
+            # Step 1: auto-regressive decode K tokens from draft model and get final p
+            draft_input_ids = copy.deepcopy(input_ids)
+            for _ in range(speculate_k):
+                # prepare model inputs
+                model_inputs = draft_model.prepare_inputs_for_generation(draft_input_ids, **model_kwargs)
+                outputs = draft_model(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+                next_token_logits = outputs.logits[:, -1, :]
+                
+                # pre-process distribution
+                next_token_scores = logits_processor(draft_input_ids, next_token_logits)
+                next_token_scores = logits_warper(draft_input_ids, next_token_scores)
+
+                # sample
+                probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+
+                draft_input_ids = torch.cat([draft_input_ids, next_tokens[:, None]], dim=-1)
+
+
+        # device, dtype = prompt.device, prompt.dtype
+        # max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+        # with torch.device(device):
+        #     model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float16)
+        #     if is_speculative and draft_model is not model:
+        #         draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float32)
+
+        # # create an empty tensor of the expected final shape and fill in the current tokens
+        # empty = torch.empty(T_new, dtype=dtype, device=device)
+        # empty[:T] = prompt
+        # seq = empty
+        # input_pos = torch.arange(0, T, device=device)
+
+        # next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+        # if is_speculative:
+        #     prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+        # seq[T] = next_token
+
+        # input_pos = torch.tensor([T], device=device, dtype=torch.int)
+        # accept_counts = [0] * (speculate_k + 1)
+
+        # if is_speculative:
+        #     input_pos = input_pos.item()  # for speculative decoding easier to keep on host
+        #     while input_pos < T_new - 1:
+        #         cur_token = next_token.view(())
+
+        #         next_tokens = speculative_decode(
+        #             model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+        #         )
+
+        #         accept_counts[len(next_tokens) - 1] += 1
+        #         num_added = min(T_new - input_pos - 1, len(next_tokens))
+        #         seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+        #         for i in next_tokens[: num_added,]:
+        #             callback(i)
+        #         input_pos = input_pos + num_added
+        #         next_token = next_tokens[-1]
+        # else:
+        #     generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        #     seq[T + 1:] = torch.cat(generated_tokens)
+
+        # generate_stats = {
+        #     'accept_counts': accept_counts
+        # }
+        # return seq, generate_stats
+
+    else:
+        return model.sample(
+            input_ids,
+            logits_processor=logits_processor,
+            logits_warper=logits_warper,
+            stopping_criteria=stopping_criteria,
+            pad_token_id=generation_config.pad_token_id,
+            eos_token_id=generation_config.eos_token_id,
+            output_scores=generation_config.output_scores,
+            synced_gpus=False,
+            return_dict_in_generate=generation_config.return_dict_in_generate,
+            **model_kwargs,), generate_stats
 
 def encode_tokens(tokenizer, string, bos=True, device='xpu'):
     tokens = tokenizer.encode(string)
@@ -272,6 +462,7 @@ def _load_transformers_model(checkpoint_path, device, is_draft):
     if is_draft:
         model = AutoModelForCausalLM.from_pretrained(checkpoint_path,
                                      load_in_low_bit="sym_int4",
+                                     optimize_model=True,
                                      trust_remote_code=True,
                                      use_cache=True).eval()
         model = model.to(device)
@@ -306,7 +497,7 @@ def main(
     tokenizer_path = checkpoint_path / "tokenizer.model"
     # assert tokenizer_path.is_file(), tokenizer_path
 
-    checkpoint_path = checkpoint_path / "model.pth"
+    # checkpoint_path = checkpoint_path / "model.pth"
 
     global print
     rank = maybe_init_dist()
@@ -316,47 +507,33 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-    device = 'xpu'
+    device = 'cpu'
+    # device = "xpu"
     precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, False, use_tp)
-    # model = _load_transformers_model(checkpoint_path, device, False)
+    model = _load_transformers_model(checkpoint_path, device, True)
 
     if is_speculative:
         print("Loading draft model ...")
-        draft_model = _load_model(draft_checkpoint_path, device, True, use_tp)
-        # draft_model = _load_transformers_model(draft_checkpoint_path, device, True)
+        draft_model = _load_transformers_model(draft_checkpoint_path, device, True)
     else:
         draft_model = None
 
-    torch.xpu.synchronize()
+    # torch.xpu.synchronize()
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-    tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
-    encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    prompt_length = encoded.size(0)
+    # tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+    tokenizer = LlamaTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+    # encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    encoded = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    prompt_length = encoded.size(1)
 
     torch.manual_seed(1234)
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
-    # if compile:
-    #     if is_speculative and use_tp:
-    #         torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
-
-    #     if is_speculative:
-    #         global model_forward, logits_to_prob
-    #         model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
-
-    #     global decode_one_token, prefill
-    #     decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
-
-    #     # Uncomment to squeeze more perf out of prefill
-    #     if args.compile_prefill:
-    #         prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
-
 
     aggregate_metrics = {
         'tokens_per_sec': [],
@@ -366,7 +543,7 @@ def main(
 
 
     for i in range(start, num_samples):
-        torch.xpu.synchronize()
+        # torch.xpu.synchronize()
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
             if is_chat:
@@ -400,7 +577,7 @@ def main(
             y, metrics = generate(
                 model,
                 encoded,
-                max_new_tokens,
+                max_new_tokens=max_new_tokens,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
                 interactive=interactive,
@@ -417,14 +594,15 @@ def main(
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
             else:
                 prof.export_chrome_trace(f"{profile}.json")
-        torch.xpu.synchronize()
+        # torch.xpu.synchronize()
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            # print(tokenizer.decode(y.tolist()))
+            print(tokenizer.decode(y[0], skip_special_tokens=True))
         else:
             print()
-        tokens_generated = y.size(0) - prompt_length
+        tokens_generated = y[0].size(0) - prompt_length
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
