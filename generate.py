@@ -81,11 +81,16 @@ def sample(logits, return_probs: bool=False, do_sample: bool=False, top_k: int=5
             
         return output_ids
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-    # input_pos: [B, S]
-    # logits = model(x, input_pos)
-    logits = model(x).logits
-    return sample(logits, **sampling_kwargs)[0]
+def prefill(model, input_ids, past_key_values, generation_config):
+    outputs = model(input_ids=input_ids,
+                       past_key_values=past_key_values,
+                       return_dict=True,
+                       use_cache=True)
+    next_token_logits = outputs.logits[:, -1, :]
+    output_ids = sample(next_token_logits, do_sample=True, top_k=generation_config.top_k,
+                        top_p=generation_config.top_p, temperature=generation_config.temperature)
+    return output_ids, outputs['past_key_values']
+    
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
@@ -329,28 +334,33 @@ def generate(
     if is_speculative:
         n = input_ids_length
         past_key_values = None
+        draft_past_key_values = None
         generate_ids = torch.empty([input_ids.size(0), generation_config.max_length], dtype=torch.long, device=model.device)
         draft_generate_ids = torch.empty([input_ids.size(0), speculate_k + 1], dtype=torch.long, device=model.device)
         # Prefill with main model
-        outputs = model(input_ids=input_ids,
-                       past_key_values=past_key_values,
-                       return_dict=True,
-                       use_cache=True)
-        next_token_logits = outputs.logits[:, -1, :]
-        output_ids = sample(next_token_logits, do_sample=True, top_k=generation_config.top_k,
-                            top_p=generation_config.top_p, temperature=generation_config.temperature)
+        output_ids, past_key_values = prefill(model,
+                                              input_ids=input_ids,
+                                              past_key_values=past_key_values,
+                                              generation_config=generation_config)
         generate_ids[:, 0] = output_ids
         current_input_ids = output_ids.unsqueeze(0)
-        past_key_values = outputs['past_key_values']
+        
+        # Prefill draft model to init kv cache
+        _, draft_past_key_values = prefill(draft_model,
+                                           input_ids=input_ids,
+                                           past_key_values=draft_past_key_values,
+                                           generation_config=generation_config)
         n += 1
         input_ids = torch.cat([input_ids, current_input_ids], dim=-1)
+        draft_token_total_time = 0
+        drafted_total_tokens = 0
 
         while n < generation_config.max_length:
             # Step 1: auto-regressive decode K tokens from draft model and get final p
             draft_current_input_ids = current_input_ids
-            draft_past_key_values = past_key_values
             draft_generate_ids[:, 0] = current_input_ids
             draft_prob_list = []
+            st = time.perf_counter()
             for step_draft in range(speculate_k):
                 draft_output = draft_model(
                     input_ids=draft_current_input_ids,
@@ -360,19 +370,23 @@ def generate(
                 )
                 draft_probs = draft_output['logits'].softmax(-1)
                 draft_prob_list.append(draft_probs)
-                draft_output_ids, draft_output_probs = sample(draft_output['logits'],
-                                                              return_probs=True, do_sample=True,
-                                                              top_k=generation_config.top_k,
-                                                              top_p=generation_config.top_p,
-                                                              temperature=generation_config.temperature)
+                draft_output_ids = sample(draft_output['logits'],
+                                          return_probs=False, do_sample=True,
+                                          top_k=generation_config.top_k,
+                                          top_p=generation_config.top_p,
+                                          temperature=generation_config.temperature)
                 draft_generate_ids[:, step_draft + 1] = draft_output_ids
                 draft_current_input_ids = draft_output_ids
                 draft_past_key_values = draft_output['past_key_values']
 
-                if draft_output_probs.item() < 0.1 or n + step_draft + 2 >= generation_config.max_new_tokens + input_ids_length:
+                if n + step_draft + 2 >= generation_config.max_new_tokens + input_ids_length:
                     break
         
             drafted_n_tokens = step_draft + 1
+
+            torch.xpu.synchronize()
+            draft_token_total_time += (time.perf_counter() - st)
+            drafted_total_tokens += drafted_n_tokens
             drafted_input_ids = draft_generate_ids[:, : drafted_n_tokens + 1] # raft input + raft completion
             
             output = model(input_ids=drafted_input_ids,
@@ -381,33 +395,30 @@ def generate(
                            use_cache=True)
             logits = output['logits']
             target_probs_cpu = logits.softmax(-1).squeeze()
-            output_ids = sample(logits, do_sample=True, top_k=generation_config.top_k,
-                                top_p=generation_config.top_p, temperature=generation_config.temperature)
             past_key_values = output['past_key_values']
 
-            max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0).sum(-1).item() + 1
             max_of_max_matched = logits.size(-2)
 
-            draft_tokens_cpu = drafted_input_ids[:, 1:].squeeze()
-            draft_probs_cpu = torch.stack(draft_prob_list).squeeze()
+            draft_tokens_cpu = drafted_input_ids[:, 1:].squeeze(0)
+            draft_probs_cpu = torch.stack(draft_prob_list).squeeze((1,2))
 
             # q: target prob, p: draft prob
             # q >= p: always accept draft token
             # q < p: q/p prob to accept draft token
-            p = draft_probs_cpu[torch.arange(0, speculate_k, device='cpu'), draft_tokens_cpu]
-            q = target_probs_cpu[torch.arange(0, speculate_k, device='cpu'), draft_tokens_cpu]
-            accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
+            p = draft_probs_cpu[torch.arange(0, drafted_n_tokens, device='cpu'), draft_tokens_cpu]
+            q = target_probs_cpu[torch.arange(0, drafted_n_tokens, device='cpu'), draft_tokens_cpu]
+            accept_draft_prob = torch.minimum(torch.ones(()), q[:drafted_n_tokens]/ p)
             rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
 
             if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
-                accept_length = speculate_k + 1
+                accept_length = drafted_n_tokens + 1
                 last_token = multinomial_sample_one_no_sync(target_probs_cpu[-1])
-                # # fill last token into draft model
-                # model_forward(
-                #     draft_model,
-                #     draft_tokens[-1].view(1, -1),
-                #     orig_input_pos + speculate_k,
-                # )
+                # fill last token into draft model
+                draft_output = draft_model(input_ids=draft_current_input_ids,
+                                           past_key_values=draft_past_key_values,
+                                           return_dict=True,
+                                           use_cache=True)
+                draft_past_key_values = draft_output['past_key_values']
                 next_tokens = torch.cat([draft_tokens_cpu, last_token])
             else:
                 accept_length = rejected_locations[0].item()
@@ -419,66 +430,29 @@ def generate(
                 next_token = multinomial_sample_one_no_sync(new)
                 next_tokens = torch.cat([draft_tokens_cpu[:accept_length], next_token])
                 # Reset past_key_values
+                # Main model
                 past_key_values = [
                     (k[:, :, :-(max_of_max_matched - accept_length - 1)], v[:, :, :-(max_of_max_matched - accept_length - 1)]) for k, v in past_key_values
                 ]
-                past_key_values
+                # Draft model
+                draft_past_key_values = [
+                    (k[:, :, :-(max_of_max_matched - accept_length - 2)], v[:, :, :-(max_of_max_matched - accept_length - 2)]) for k, v in draft_past_key_values
+                ]
 
             accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(generation_config.max_length - n - 1, len(next_tokens))
+            num_added = min(generation_config.max_length - n, len(next_tokens))
             n += num_added
-            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(0)], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens[:num_added].unsqueeze(0)], dim=-1)
+            # print(f"n: {n}, num_added: {num_added}, input_ids: {input_ids.size()}, next_tokens: {next_tokens.size()}")
             current_input_ids = input_ids[:, -1:]
 
+        generate_stats = {
+            'accept_counts': accept_counts,
+            'draft_token_latency': draft_token_total_time / drafted_total_tokens
+        }
+        print(generate_stats)
 
-
-
-        # device, dtype = prompt.device, prompt.dtype
-        # max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
-        # with torch.device(device):
-        #     model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float16)
-        #     if is_speculative and draft_model is not model:
-        #         draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length, dtype=torch.float32)
-
-        # # create an empty tensor of the expected final shape and fill in the current tokens
-        # empty = torch.empty(T_new, dtype=dtype, device=device)
-        # empty[:T] = prompt
-        # seq = empty
-        # input_pos = torch.arange(0, T, device=device)
-
-        # next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-        # if is_speculative:
-        #     prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-        # seq[T] = next_token
-
-        # input_pos = torch.tensor([T], device=device, dtype=torch.int)
-        # accept_counts = [0] * (speculate_k + 1)
-
-        # if is_speculative:
-        #     input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        #     while input_pos < T_new - 1:
-        #         cur_token = next_token.view(())
-
-        #         next_tokens = speculative_decode(
-        #             model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
-        #         )
-
-        #         accept_counts[len(next_tokens) - 1] += 1
-        #         num_added = min(T_new - input_pos - 1, len(next_tokens))
-        #         seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
-        #         for i in next_tokens[: num_added,]:
-        #             callback(i)
-        #         input_pos = input_pos + num_added
-        #         next_token = next_tokens[-1]
-        # else:
-        #     generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        #     seq[T + 1:] = torch.cat(generated_tokens)
-
-        # generate_stats = {
-        #     'accept_counts': accept_counts
-        # }
-        # return seq, generate_stats
-
+        return input_ids, generate_stats
     else:
         return model.sample(
             input_ids,
@@ -566,8 +540,11 @@ def _load_transformers_model(checkpoint_path, device, is_draft):
                                      use_cache=True).eval()
         model = model.to(device)
     else:
+        dtype = torch.float16
+        print(f"IPEX optimize device: {device}, dtype: {dtype}")
         model = AutoModelForCausalLM.from_pretrained(checkpoint_path, use_cache=True).eval()
         model = model.half().to(device)
+        model = ipex.optimize(model)
 
     return model
 
@@ -606,15 +583,15 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-    device = 'cpu'
-    # device = "xpu"
+    # device = 'cpu'
+    device = "xpu"
     precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_transformers_model(checkpoint_path, device, True)
+    model = _load_transformers_model(checkpoint_path, device, False)
 
     if is_speculative:
         print("Loading draft model ...")
@@ -622,9 +599,10 @@ def main(
     else:
         draft_model = None
 
-    # torch.xpu.synchronize()
+    torch.xpu.synchronize()
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
+    prompt = open(f"/home/wangruonan/yina/BigDL/python/llm/dev/benchmark/all-in-one/prompt/1024.txt", 'r').read()
     # tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
     tokenizer = LlamaTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
     # encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
@@ -642,7 +620,7 @@ def main(
 
 
     for i in range(start, num_samples):
-        # torch.xpu.synchronize()
+        torch.xpu.synchronize()
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
             if is_chat:
@@ -693,7 +671,7 @@ def main(
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
             else:
                 prof.export_chrome_trace(f"{profile}.json")
-        # torch.xpu.synchronize()
+        torch.xpu.synchronize()
         t = time.perf_counter() - t0
 
         if not interactive:
@@ -704,7 +682,7 @@ def main(
         tokens_generated = y[0].size(0) - prompt_length
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
+        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec, tokens_generated:{tokens_generated}")
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
         print(f"------------\n")
     print("==========")
